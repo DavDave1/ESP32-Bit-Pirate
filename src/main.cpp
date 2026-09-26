@@ -12,6 +12,7 @@
 #include <Boards/StickS3/StickS3Board.h>
 #include <Boards/StampS3/StampS3Board.h>
 #include <Boards/S3DevKit/S3DevKitBoard.h>
+#include <Boards/UMProS3/UMProS3Board.h>
 #include <Boards/Common/Inputs/DefaultInput.h>
 #include <Boards/TDisplayS3/TDisplayS3Board.h>
 #include <Boards/WaveshareS3Geek/WaveshareS3GeekBoard.h>
@@ -135,6 +136,12 @@ void setup() {
         IHostSerial& hostSerial = board.getHostSerial();
     #elif defined(DEVICE_S3DEVKIT)
         S3DevKitBoard board;
+        board.initialize();
+        IDeviceView& deviceView = board.getDeviceView();
+        IInput& deviceInput = board.getDeviceInput();
+        IHostSerial& hostSerial = board.getHostSerial();
+    #elif defined(DEVICE_UMPROS3)
+        UMProS3Board board;
         board.initialize();
         IDeviceView& deviceView = board.getDeviceView();
         IInput& deviceInput = board.getDeviceInput();
