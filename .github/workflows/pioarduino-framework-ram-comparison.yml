@@ -1,0 +1,308 @@
+name: Pioarduino RAM Comparison
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pioarduino-ram-comparison
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    name: Compare pinned vs latest stable
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install PlatformIO
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade platformio
+          pio --version
+
+      - name: Prepare isolated source trees
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PINNED_DIR="${RUNNER_TEMP}/pinned"
+          LATEST_DIR="${RUNNER_TEMP}/latest"
+
+          rm -rf "${PINNED_DIR}" "${LATEST_DIR}"
+          mkdir -p "${PINNED_DIR}" "${LATEST_DIR}"
+
+          # Both builds use exactly the same repository revision.
+          git archive HEAD | tar -x -C "${PINNED_DIR}"
+          git archive HEAD | tar -x -C "${LATEST_DIR}"
+
+          # Change only the global pioarduino platform in the "latest" copy.
+          python <<'PY'
+          import os
+          from pathlib import Path
+
+          stable = (
+              "https://github.com/pioarduino/platform-espressif32/"
+              "releases/download/stable/platform-espressif32.zip"
+          )
+
+          path = Path(os.environ["RUNNER_TEMP"]) / "latest" / "platformio.ini"
+          lines = path.read_text().splitlines()
+
+          section = None
+          replaced = 0
+
+          for index, line in enumerate(lines):
+              stripped = line.strip()
+
+              if stripped.startswith("[") and stripped.endswith("]"):
+                  section = stripped
+                  continue
+
+              if (
+                  section == "[env]"
+                  and stripped.startswith("platform")
+                  and "=" in stripped
+              ):
+                  lines[index] = f"platform = {stable}"
+                  replaced += 1
+                  break
+
+          if replaced != 1:
+              raise SystemExit(
+                  "Could not replace the global [env] platform entry"
+              )
+
+          path.write_text("\n".join(lines) + "\n")
+          PY
+
+          echo "Pinned platform:"
+          grep -m1 \
+            '^[[:space:]]*platform[[:space:]]*=' \
+            "${PINNED_DIR}/platformio.ini"
+
+          echo "Latest platform:"
+          grep -m1 \
+            '^[[:space:]]*platform[[:space:]]*=' \
+            "${LATEST_DIR}/platformio.ini"
+
+      - name: Build pinned framework
+        id: pinned
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/pinned
+        env:
+          PLATFORMIO_NO_ANSI: "true"
+          PLATFORMIO_CORE_DIR: ${{ runner.temp }}/pio-core-pinned
+        shell: bash
+        run: |
+          set -euo pipefail
+          pio run -e s3-devkit 2>&1 | tee "${RUNNER_TEMP}/pinned.log"
+
+      - name: Build latest stable framework
+        id: latest
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/latest
+        env:
+          PLATFORMIO_NO_ANSI: "true"
+          PLATFORMIO_CORE_DIR: ${{ runner.temp }}/pio-core-latest
+        shell: bash
+        run: |
+          set -euo pipefail
+          pio run -e s3-devkit 2>&1 | tee "${RUNNER_TEMP}/latest.log"
+
+      - name: Generate comparison summary
+        if: always()
+        env:
+          PINNED_OUTCOME: ${{ steps.pinned.outcome }}
+          LATEST_OUTCOME: ${{ steps.latest.outcome }}
+        shell: bash
+        run: |
+          python <<'PY'
+          import os
+          import re
+          import textwrap
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"])
+
+          def parse(name):
+              path = root / f"{name}.log"
+
+              if not path.exists():
+                  return None
+
+              text = path.read_text(errors="replace")
+
+              ram = re.search(
+                  r"RAM:\s+\[[^\]]*\]\s+([\d.]+)%\s+"
+                  r"\(used\s+(\d+)\s+bytes from\s+(\d+)\s+bytes\)",
+                  text,
+              )
+
+              flash = re.search(
+                  r"Flash:\s+\[[^\]]*\]\s+([\d.]+)%\s+"
+                  r"\(used\s+(\d+)\s+bytes from\s+(\d+)\s+bytes\)",
+                  text,
+              )
+
+              platform = re.search(
+                  r"^PLATFORM:\s*(.+)$",
+                  text,
+                  re.MULTILINE,
+              )
+
+              framework = re.search(
+                  r"framework-arduinoespressif32\s+@\s+([^\r\n]+)",
+                  text,
+              )
+
+              return {
+                  "ram_pct": float(ram.group(1)) if ram else None,
+                  "ram": int(ram.group(2)) if ram else None,
+                  "ram_total": int(ram.group(3)) if ram else None,
+                  "flash": int(flash.group(2)) if flash else None,
+                  "platform": (
+                      platform.group(1).strip()
+                      if platform
+                      else "unknown"
+                  ),
+                  "framework": (
+                      framework.group(1).strip()
+                      if framework
+                      else "unknown"
+                  ),
+              }
+
+          pinned = parse("pinned")
+          latest = parse("latest")
+
+          pinned_ok = os.environ["PINNED_OUTCOME"] == "success"
+          latest_ok = os.environ["LATEST_OUTCOME"] == "success"
+
+          def fmt_bytes(value):
+              return f"{value:,} B" if value is not None else "n/a"
+
+          def fmt_pct(value):
+              return f"{value:.2f}%" if value is not None else "n/a"
+
+          def safe(value):
+              return str(value).replace("|", "\\|")
+
+          rows = []
+
+          for label, ok, data in (
+              ("Pinned", pinned_ok, pinned),
+              ("Latest stable", latest_ok, latest),
+          ):
+              rows.append(
+                  f"| {label} "
+                  f"| {'success' if ok else 'FAILED'} "
+                  f"| {safe(data['framework']) if data else 'n/a'} "
+                  f"| {fmt_bytes(data['ram']) if data else 'n/a'} "
+                  f"| {fmt_pct(data['ram_pct']) if data else 'n/a'} "
+                  f"| {fmt_bytes(data['flash']) if data else 'n/a'} |"
+              )
+
+          delta = "Build comparison unavailable."
+
+          if (
+              pinned_ok
+              and latest_ok
+              and pinned
+              and latest
+              and pinned["ram"] is not None
+              and latest["ram"] is not None
+          ):
+              ram_delta = latest["ram"] - pinned["ram"]
+              ram_pct_delta = (
+                  latest["ram_pct"] - pinned["ram_pct"]
+              )
+
+              delta = (
+                  f"**RAM delta:** {ram_delta:+,} B "
+                  f"({ram_pct_delta:+.2f} percentage points)"
+              )
+
+              if (
+                  pinned["flash"] is not None
+                  and latest["flash"] is not None
+              ):
+                  flash_delta = latest["flash"] - pinned["flash"]
+                  delta += (
+                      f"  \n**Flash delta:** {flash_delta:+,} B"
+                  )
+
+          pinned_platform = (
+              pinned["platform"] if pinned else "unknown"
+          )
+          latest_platform = (
+              latest["platform"] if latest else "unknown"
+          )
+
+          summary = textwrap.dedent(
+              f"""
+              # Pioarduino memory comparison
+
+              Environment: `s3-devkit`
+
+              | Build | Status | Arduino framework | Static RAM | RAM % | Flash |
+              |---|---|---|---:|---:|---:|
+              {chr(10).join(rows)}
+
+              {delta}
+
+              **Pinned platform:** `{safe(pinned_platform)}`  
+              **Latest platform:** `{safe(latest_platform)}`
+
+              > PlatformIO RAM = static `.data + .bss`.
+              > This is not runtime heap usage after boot.
+              """
+          ).lstrip()
+
+          print(summary)
+
+          with open(
+              os.environ["GITHUB_STEP_SUMMARY"],
+              "a",
+          ) as output:
+              output.write(summary)
+
+          PY
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pioarduino-ram-comparison-logs
+          path: |
+            ${{ runner.temp }}/pinned.log
+            ${{ runner.temp }}/latest.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Fail if either build failed
+        if: always()
+        env:
+          PINNED_OUTCOME: ${{ steps.pinned.outcome }}
+          LATEST_OUTCOME: ${{ steps.latest.outcome }}
+        shell: bash
+        run: |
+          if [[ "${PINNED_OUTCOME}" != "success" || \
+                "${LATEST_OUTCOME}" != "success" ]]; then
+            echo "One of the comparison builds failed."
+            echo "See the workflow summary and build logs."
+            exit 1
+          fi
