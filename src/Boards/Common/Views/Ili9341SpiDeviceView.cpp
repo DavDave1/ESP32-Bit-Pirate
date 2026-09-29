@@ -1,4 +1,4 @@
-#if defined(DEVICE_TEMBEDS3) || defined(DEVICE_TEMBEDS3CC1101) || defined(DEVICE_VISION_MASTER_T190) || (defined(DEVICE_CUSTOM) && defined(CUSTOM_DISPLAY_DRIVER_ILI9341_SPI))
+#if defined(DEVICE_CUSTOM) && defined(CUSTOM_DISPLAY_DRIVER_ILI9341_SPI)
 
 #include "Boards/Common/Views/Ili9341SpiDeviceView.h"
 #include "Data/WelcomeScreen.h"
